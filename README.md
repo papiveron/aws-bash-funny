@@ -14,7 +14,7 @@ The process and mecanism to manage instances provisionning and lifecycle is up t
  
 The script first deletes the preprod rds if it exists, before creating it, and has four functions :
 
-  *create_instance : create the rds instance from the last production snapshot
-  *set_datas: updates databases, by making a dump / export of the prod databases and imports them in preprod rds
-  *delete_insance : delete rds instance
+  * create_instance : create the rds instance from the last production snapshot
+  * set_datas: updates databases, by making a dump / export of the prod databases and imports them in preprod rds
+  * delete_insance : delete rds instance
   * reboot_intance: restart the rds instance
