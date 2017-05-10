@@ -1,0 +1,209 @@
+#!/bin/bash
+ 
+##########################################################################
+# main_preprod_rds_provisionning.sh
+#
+# Usage:
+#   ./main_preprod_rds_provisionning.sh action [source_instance] [target_instance]
+#
+# Creates a new preprod RDS instance by cloning the latest production snapshot.
+# More specifically, the following steps are performed:
+#   - Determine the snapshot id to use
+#   - Delete the existing database
+#   - Create the new database
+#   - Make necessary modifications to the new instance (disable backups)
+##########################################################################
+ 
+region="eu-west-1"
+aws="/usr/local/bin/aws"
+python="/usr/bin/python"
+log_file="/tmp/rds_clone.log"
+security_groups=""
+subnet_group=""
+parameter_group=""
+open=False
+ 
+function wait_for_status {
+    instance=$1
+    target_status=$2
+    status="unknown"
+    while [[ "$status" != "$target_status" ]]; do
+        status=$($aws --region $region rds describe-db-instances \
+            --db-instance-identifier $instance \
+            | $python -c 'import json,sys; db_instances=json.load(sys.stdin); \
+            db_instances_list = db_instances.get("DBInstances", []); \
+            print db_instances_list[0]["DBInstanceStatus"] if db_instances_list else "";' 2>&1 | tee -a $log_file)
+        sleep 5
+    done
+}
+ 
+function wait_until_deleted {
+    instance=$1
+    count=0
+    while [[ "$count" == "0" ]]; do
+        count=$($aws --region $region rds describe-db-instances \
+            --db-instance-identifier $instance >>$log_file 2>&1)
+        count=$?
+        sleep 5
+    done
+}
+ 
+function delete_instance {
+    instance=$1
+    echo "Deleting database (if exists): $instance"
+    find_instance=$($aws --region "$region" rds describe-db-instances \
+        --db-instance-identifier "$instance" >> $log_file 2>&1)
+    find_instance=$?
+    if [[ "$find_instance" == "0" ]]; then
+        $aws --region "$region" rds delete-db-instance \
+            --db-instance-identifier "$instance" \
+            --skip-final-snapshot >> $log_file 2>&1
+        wait_until_deleted $instance
+    fi
+}
+ 
+function reboot_instance {
+    instance=$1
+    echo "Rebooting database (if exists): $instance"
+    find_instance=$($aws --region "$region" rds describe-db-instances \
+        --db-instance-identifier "$instance" >> $log_file 2>&1)
+    find_instance=$?
+    if [[ "$find_instance" == "0" ]]; then
+        $aws --region "$region" rds reboot-db-instance \
+            --db-instance-identifier "$instance"  >> $log_file 2>&1
+        sleep 10
+        wait_for_status $instance available
+    fi
+}
+ 
+function import_datas {
+    source_instance=$1
+    target_instance=$2
+    exit_status=255
+    USER=""
+    PASSWORD=""
+    DUMPFILE="/home/admin/preprod_provisioning.sql"
+    MYOPTIONS="--single-transaction --quick --order-by-primary --add-drop-database --add-drop-table"
+ 
+    source_host=$($aws --region $region rds describe-db-instances \
+        --db-instance-identifier $source_instance \
+        | $python -c 'import json,sys; db_instances=json.load(sys.stdin); \
+        db_instance = db_instances.get("DBInstances", [{}])[0]; \
+        print db_instance.get("Endpoint", {}).get("Address", "");' 2>&1 | tee -a $log_file)
+    target_host=$($aws --region $region rds describe-db-instances \
+        --db-instance-identifier $target_instance \
+        | $python -c 'import json,sys; db_instances=json.load(sys.stdin); \
+        db_instance = db_instances.get("DBInstances", [{}])[0]; \
+        print db_instance.get("Endpoint", {}).get("Address", "");' 2>&1 | tee -a $log_file)
+    databases=$(mysql -N -u"$USER" -p"$PASSWORD" -h"$source_host" \
+        <<<"SHOW DATABASES" | grep -v innodb | grep -v performance_schema \
+        | grep -v mysql | grep -v information_schema | grep -v tmp | tr "\n" " ")
+    mysqldump -u"$USER" -p"$PASSWORD" -h"$source_host" $MYOPTIONS --databases $databases > "$DUMPFILE"
+    mysql -u"$USER" -p"$PASSWORD" -h"$target_host" < "$DUMPFILE"
+    exit_status=$?
+ 
+    #comment the rm statement below in case you want to check the dump for debuging purposes
+    rm -f $DUMPFILE > /dev/null 2>&1
+    return $exit_status
+}
+ 
+function create_instance {
+    source_instance=$1
+    new_instance=$2
+    instance_class=$3
+    exit_status=255
+ 
+    echo "Deleting database (if exists): $new_instance"
+    find_instance=$($aws --region "$region" rds describe-db-instances \
+        --db-instance-identifier "$new_instance" >> $log_file 2>&1)
+    find_instance=$?
+    if [[ "$find_instance" == "0" ]]; then
+        $aws --region "$region" rds delete-db-instance \
+            --db-instance-identifier "$new_instance" \
+            --skip-final-snapshot >> $log_file 2>&1
+        wait_until_deleted $new_instance
+    fi
+    echo "Creating new database: $new_instance from $source_instance"
+    snapshot_id=$($aws --region $region rds describe-db-snapshots \
+        --db-instance-identifier $source_instance \
+        | $python -c 'import json,sys; snapshots=json.load(sys.stdin); \
+        snapshotlist = snapshots.get("DBSnapshots", []); \
+        print snapshotlist[-1]["DBSnapshotIdentifier"] if snapshotlist else "";' 2>&1 | tee -a $log_file)
+    if [[ ! -z "$snapshot_id" ]]; then
+        db_instance_param=$($aws --region $region rds describe-db-instances \
+            --db-instance-identifier $source_instance \
+            | $python -c 'import json,sys; db_instances=json.load(sys.stdin); \
+            db_instance = db_instances.get("DBInstances")[0]; \
+            temp={"sg_ids": [str(sg["VpcSecurityGroupId"]) for sg in db_instance["VpcSecurityGroups"]], \
+            "subnet_grp_name": str(db_instance.get("DBSubnetGroup", {}).get("DBSubnetGroupName", "")), \
+            "parameter_group": str(db_instance.get("DBParameterGroups", [{}])[0].get("DBParameterGroupName", ""))}; \
+            print("sg_ids:{sg_ids}|subnet_grp_name:{subnet_grp_name}|parameter_group:{parameter_group}".format(**temp));' 2>&1 | tee -a $log_file)
+        security_groups=$(echo $db_instance_param | awk -F'|' '{print $1}' | awk -F':' '{print $2}'| tr -d "[]'" | sed 's/,/ /g')
+        subnet_group=$(echo $db_instance_param | awk -F'|' '{print $2}' | awk -F':' '{print $2}')
+        parameter_group=$(echo $db_instance_param | awk -F'|'  '{print $3}' | awk -F':' '{print $2}')
+        $aws rds --region $region restore-db-instance-from-db-snapshot \
+            --db-instance-identifier "$new_instance" \
+            --db-snapshot-identifier=$snapshot_id \
+            --db-instance-class $instance_class \
+            --storage-type standard \
+            --publicly-accessible \
+            --no-multi-az \
+            --no-auto-minor-version-upgrade \
+            --db-subnet-group-name $subnet_group >> $log_file
+        if test "$?" -eq 0; then
+            echo "Waiting for new DB instance to be available"
+            sleep 5
+            wait_for_status $new_instance available
+            exit_status=0
+        else
+            exit_status=255
+        fi
+    fi
+    return $exit_status
+}
+ 
+case "$1" in
+    create_instance)
+        if test "$#" -ne 4; then
+            echo "create_instance take exactly 3 arguments :
+            the source (prod) instance name, the new instance name, and the new instance class"
+            exit 2
+        fi
+        create_instance $2 $3 $4
+        if test "$?" -eq 0; then
+            echo "New instance $3 is available"
+            echo "Disabling backup retention"
+            # disable backup retention
+            $aws --region $region rds modify-db-instance \
+                --db-instance-identifier $3 \
+                --backup-retention-period 0 \
+                --db-parameter-group-name $parameter_group \
+                --vpc-security-group-ids $security_groups \
+                --no-publicly-accessible --apply-immediately
+            echo "Waiting for $2 RDS instance to be available"
+            sleep 5
+            wait_for_status $3 available
+            echo "$2 instance is available"
+            echo "Clone and provisionning process is copmlete"
+        else
+            echo "The new instance has not been  created, try to check why, fix and try aigain"
+        fi
+        ;;
+ 
+    set_datas)
+        import_datas $2 $3
+        ;;
+ 
+    delete_instance)
+        delete_instance $2
+        ;;
+ 
+    reboot_instance)
+        reboot_instance $2
+        ;;
+ 
+    *)
+        echo $"Usage: $0 {create_instance|set_datas|delete_instance|reboot_instnce} \
+            [source_instance] [target_instance] [instance_class]"; exit
+ 
+esac
