@@ -1,4 +1,4 @@
-# aws-bash-funny scripts
+# aws-hack-rds tools/scripts
 
 ## RDS Preprod Provisionning
 
